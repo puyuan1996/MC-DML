@@ -1,20 +1,36 @@
+# src/llm.py
+
 import json
 from typing import List, Dict
 from collections import deque
+import numpy as np
 
-from .openai_helpers import chat_completion_with_retries, truncate_text
+# 导入经过改造的辅助函数
+from .openai_helpers import chat_completion_with_retries, truncate_text, init_qwen_model
 from .utils import softmax
 
 
 class LLMAgent:
     """
     LLM Agent for selecting actions in a text-based adventure game.
+    Supports both OpenAI and local Qwen models.
     """
     def __init__(self, args):
+        # 新增 llm_provider 参数来决定使用哪个模型
+        self.provider = args.llm_provider
         self.model = args.llm_model
         self.max_memory = args.max_memory
         self.llm_temperature = args.llm_temperature
         self.softmax_temperature = args.softmax_temperature
+
+        # 如果选择 qwen，则初始化本地模型
+        if self.provider == 'qwen':
+            # qwen_model_path 需要在 args 中提供
+            if not hasattr(args, 'qwen_model_path') or not args.qwen_model_path:
+                raise ValueError("Argument 'qwen_model_path' is required when llm_provider is 'qwen'.")
+            init_qwen_model(args.qwen_model_path)
+        elif self.provider != 'openai':
+            raise ValueError(f"Unsupported llm_provider: {self.provider}. Choose 'openai' or 'qwen'.")
 
 
     def _format_state(self, state_node):
@@ -22,7 +38,6 @@ class LLMAgent:
 
 
     def get_probs_prompts(self, state_node, memory):
-
         formatted_state = self._format_state(state_node)
         actions_str = [f"{i}: {a}" for i, a in enumerate(state_node.valid_actions)]
         formatted_actions = "\n".join(actions_str)
@@ -55,44 +70,87 @@ class LLMAgent:
     
     def get_action_probs(self, state_node, memory):
         sys_prompt, user_prompt = self.get_probs_prompts(state_node, memory)
-
         valid_labels = [str(i) for i in range(len(state_node.valid_actions))]
 
+        # 调用通用的 chat_completion 函数，并传入 provider
         res = chat_completion_with_retries(
             model=self.model,
             sys_prompt=sys_prompt,
             prompt=user_prompt,
-            max_tokens=2,
+            llm_provider=self.provider, # 关键参数
+            max_tokens=8, # 增加 token 长度以适应 Qwen
             temperature=self.llm_temperature,
-            logprobs=True,
-            top_logprobs=min(len(state_node.valid_actions), 20)
+            # OpenAI 特有参数，Qwen 会忽略它们
+            logprobs=True if self.provider == 'openai' else None,
+            top_logprobs=min(len(state_node.valid_actions), 20) if self.provider == 'openai' else None
         )
         
-        text = res.choices[0].message.content
+        if not res or not res.choices:
+            print("WARNING: LLM call failed or returned empty response. Falling back to uniform probabilities.")
+            text = np.random.choice(valid_labels)
+            probs_list = [1.0 / len(valid_labels)] * len(valid_labels)
+            return text, probs_list
 
-        top_logprobs = res.choices[0].logprobs.content[0].top_logprobs
-        
-        action_log_dict = {}
-        for i, logprob in enumerate(top_logprobs):
-            action_token = logprob.token
-            action_logprob = logprob.logprob
-            action_log_dict[action_token] = action_logprob
+        # print(f"res: {res}")
+        # import ipdb;ipdb.set_trace()
 
-        logprobs_list = [action_log_dict.get(label, -5) for label in valid_labels]
-        probs_list = softmax(logprobs_list, self.softmax_temperature)
+        if self.provider == 'openai':
+            text = res.choices[0].message.content.strip()
+
+            # --- OpenAI: 使用 logprobs 计算概率分布 ---
+            top_logprobs = res.choices[0].logprobs.content[0].top_logprobs
+            
+            action_log_dict = {}
+            for logprob in top_logprobs:
+                action_token = logprob.token.strip()
+                action_logprob = logprob.logprob
+                if action_token in valid_labels:
+                    action_log_dict[action_token] = action_logprob
+
+            logprobs_list = [action_log_dict.get(label, -10) for label in valid_labels] # 使用更低的默认值
+            probs_list = softmax(logprobs_list, self.softmax_temperature)
+
+        elif self.provider == 'qwen':
+            text = res.choices[0].message["content"].strip()
+
+            # --- Qwen: 根据模型输出的单个选择构造概率分布 ---
+            # 清理模型输出，只保留数字
+            import re
+            numeric_part = re.search(r'\d+', text)
+            if numeric_part:
+                text = numeric_part.group(0)
+            
+            probs_list = [0.0] * len(valid_labels)
+            if text in valid_labels:
+                chosen_index = int(text)
+                probs_list[chosen_index] = 1.0  # One-hot 概率分布
+            else:
+                # 如果模型输出无效，则使用均匀分布作为后备
+                print(f"WARNING: Qwen output '{text}' is not a valid action index. Falling back to uniform distribution.")
+                probs_list = [1.0 / len(valid_labels)] * len(valid_labels)
+                # 随机选择一个有效动作作为文本输出
+                text = np.random.choice(valid_labels)
         
         return text, probs_list
 
 
     def get_traj_reflection(self, trajectory: List[Dict]) -> str:
         sys_prompt, prompt = self.get_reflection_prompts(trajectory)
+        
+        # 调用时传入 provider
         res = chat_completion_with_retries(
             model=self.model,
             sys_prompt=sys_prompt,
             prompt=user_prompt,
-            max_tokens=64,
+            llm_provider=self.provider, # 关键参数
+            max_tokens=128, # 为反思提供更长的生成空间
             temperature=self.llm_temperature
         )
+
+        if not res or not res.choices:
+            print("WARNING: Reflection generation failed.")
+            return "Failed to generate reflection."
+
         text = res.choices[0].message.content
-        print(text)
+        print(f"Generated Reflection: {text}")
         return text
