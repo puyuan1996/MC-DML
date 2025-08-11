@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument('--qwen_model_path', default='/fs-computility/niuyazhe/shared/xiongjyu/model/Qwen2.5-7B-Instruct', type=str)
 
     # parser.add_argument('--llm_model', default='gpt-3.5-turbo', type=str)
-    parser.add_argument('--llm_temperature', default=0, type=int)
+    parser.add_argument('--llm_temperature', default=0.01, type=int)
     parser.add_argument('--max_memory', default=3, type=int)
     parser.add_argument('--softmax_temperature', default=5, type=int)
     return parser.parse_args()

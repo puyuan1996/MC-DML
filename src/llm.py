@@ -4,6 +4,7 @@ import json
 from typing import List, Dict
 from collections import deque
 import numpy as np
+import re
 
 # 导入经过改造的辅助函数
 from .openai_helpers import chat_completion_with_retries, truncate_text, init_qwen_model
@@ -72,6 +73,12 @@ class LLMAgent:
         sys_prompt, user_prompt = self.get_probs_prompts(state_node, memory)
         valid_labels = [str(i) for i in range(len(state_node.valid_actions))]
 
+        # --- 修改点 1: 解决 Qwen temperature 为 0 的问题 ---
+        # 如果是 qwen 且 temperature 为 0, 设置为一个极小的正数
+        temp = self.llm_temperature
+        if self.provider == 'qwen' and temp == 0:
+            temp = 0.01
+
         # 调用通用的 chat_completion 函数，并传入 provider
         res = chat_completion_with_retries(
             model=self.model,
@@ -79,7 +86,7 @@ class LLMAgent:
             prompt=user_prompt,
             llm_provider=self.provider, # 关键参数
             max_tokens=8, # 增加 token 长度以适应 Qwen
-            temperature=self.llm_temperature,
+            temperature=temp, # 使用修正后的 temperature
             # OpenAI 特有参数，Qwen 会忽略它们
             logprobs=True if self.provider == 'openai' else None,
             top_logprobs=min(len(state_node.valid_actions), 20) if self.provider == 'openai' else None
@@ -90,9 +97,6 @@ class LLMAgent:
             text = np.random.choice(valid_labels)
             probs_list = [1.0 / len(valid_labels)] * len(valid_labels)
             return text, probs_list
-
-        # print(f"res: {res}")
-        # import ipdb;ipdb.set_trace()
 
         if self.provider == 'openai':
             text = res.choices[0].message.content.strip()
@@ -115,7 +119,6 @@ class LLMAgent:
 
             # --- Qwen: 根据模型输出的单个选择构造概率分布 ---
             # 清理模型输出，只保留数字
-            import re
             numeric_part = re.search(r'\d+', text)
             if numeric_part:
                 text = numeric_part.group(0)
@@ -135,22 +138,35 @@ class LLMAgent:
 
 
     def get_traj_reflection(self, trajectory: List[Dict]) -> str:
+        # 此处变量名是 prompt, 而不是 user_prompt
         sys_prompt, prompt = self.get_reflection_prompts(trajectory)
         
+        # --- 修改点 2: 同样解决 Qwen temperature 为 0 的问题 ---
+        temp = self.llm_temperature
+        if self.provider == 'qwen' and temp == 0:
+            temp = 0.01
+
         # 调用时传入 provider
         res = chat_completion_with_retries(
             model=self.model,
             sys_prompt=sys_prompt,
-            prompt=user_prompt,
+            # --- 修改点 3: 修正 NameError ---
+            # 将 user_prompt 改为 prompt
+            prompt=prompt,
             llm_provider=self.provider, # 关键参数
             max_tokens=128, # 为反思提供更长的生成空间
-            temperature=self.llm_temperature
+            temperature=temp # 使用修正后的 temperature
         )
 
         if not res or not res.choices:
             print("WARNING: Reflection generation failed.")
             return "Failed to generate reflection."
 
-        text = res.choices[0].message.content
+        # 同样适配 qwen 的输出格式
+        if self.provider == 'qwen':
+            text = res.choices[0].message["content"]
+        else: # openai
+            text = res.choices[0].message.content
+            
         print(f"Generated Reflection: {text}")
         return text
